@@ -11,4 +11,9 @@ describe("Database.Path", () => {
       : path.join(Global.Path.data, `opencode-${InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
     expect(Database.getChannelPath()).toBe(expected)
   })
+
+  test("uses delete journal mode", () => {
+    const result = Database.Client().$client.query("PRAGMA journal_mode").get() as { journal_mode: string }
+    expect(result.journal_mode).toBe("delete")
+  })
 })
