@@ -9,7 +9,7 @@ import { Log } from "../util"
 import { NamedError } from "@opencode-ai/shared/util/error"
 import z from "zod"
 import path from "path"
-import { readFileSync, readdirSync, existsSync } from "fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "fs"
 import { Flag } from "../flag/flag"
 import { InstallationChannel } from "../installation/version"
 import { InstanceState } from "@/effect"
@@ -48,6 +48,12 @@ type Client = SQLiteBunDatabase
 
 type Journal = { sql: string; timestamp: number; name: string }[]
 
+type Lock = {
+  release: () => void
+}
+
+let lock: Lock | undefined
+
 function time(tag: string) {
   const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(tag)
   if (!match) return 0
@@ -81,8 +87,72 @@ function migrations(dir: string): Journal {
   return sql.sort((a, b) => a.timestamp - b.timestamp)
 }
 
+function errorCode(error: unknown) {
+  if (typeof error !== "object" || error === null || !("code" in error)) return
+  return typeof error.code === "string" ? error.code : undefined
+}
+
+function stale(file: string, staleMs: number) {
+  try {
+    return Date.now() - statSync(file).mtimeMs > staleMs
+  } catch (error) {
+    const code = errorCode(error)
+    if (code === "ENOENT" || code === "ENOTDIR") return false
+    throw error
+  }
+}
+
+function acquireLock(file: string) {
+  if (file === ":memory:") return
+
+  const lockDir = `${file}.lock`
+  const heartbeat = path.join(lockDir, "heartbeat")
+  const meta = path.join(lockDir, "meta.json")
+  const staleMs = 15_000
+
+  const create = () => {
+    mkdirSync(lockDir, { mode: 0o700 })
+    writeFileSync(heartbeat, "", { flag: "wx" })
+    writeFileSync(
+      meta,
+      JSON.stringify({ pid: process.pid, hostname: process.env["HOSTNAME"] ?? "unknown" }, null, 2),
+      { flag: "wx" },
+    )
+  }
+
+  try {
+    create()
+  } catch (error) {
+    if (errorCode(error) !== "EEXIST") throw error
+    if (!stale(heartbeat, staleMs) && !stale(meta, staleMs) && !stale(lockDir, staleMs)) {
+      throw new Error(
+        `OpenCode database is already in use at ${file}. Running multiple processes against the same data directory is not supported because it can corrupt SQLite. Use a different XDG data/state directory or set OPENCODE_DB.`,
+      )
+    }
+    rmSync(lockDir, { recursive: true, force: true })
+    create()
+  }
+
+  const timer = setInterval(() => {
+    const time = new Date()
+    try {
+      utimesSync(heartbeat, time, time)
+    } catch {}
+  }, Math.max(1000, Math.floor(staleMs / 3)))
+  timer.unref?.()
+
+  return {
+    release() {
+      clearInterval(timer)
+      rmSync(lockDir, { recursive: true, force: true })
+    },
+  } satisfies Lock
+}
+
 export const Client = lazy(() => {
   log.info("opening database", { path: Path })
+
+  lock ??= acquireLock(Path)
 
   const db = init(Path)
 
@@ -117,6 +187,8 @@ export const Client = lazy(() => {
 export function close() {
   Client().$client.close()
   Client.reset()
+  lock?.release()
+  lock = undefined
 }
 
 export type TxOrDb = Transaction | Client
